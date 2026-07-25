@@ -1,22 +1,30 @@
-# Build outputs and compiled binaries
-*.hex
+
 *.elf
-*.bin
-*.eep
 *.obj
 *.o
 *.a
-*.map
-*.lst
-*.sym
+*.lib
+*.srec
 
-# IDE and Editor files
+*.he
+!AVR/i4004/hex/*.hex
+
+*.aws
+*.lss
+*.map
+*.sym
+*.eep
+*.lst
+.atsuo/
+Debug/
+Release/
+
 .vscode/
 .idea/
-*.swp
-*.swo
-*~
+*.user
 
-# OS generated files
 .DS_Store
 Thumbs.db
+
+*.tmp
+*.log
