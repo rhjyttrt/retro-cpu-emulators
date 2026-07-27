@@ -7,31 +7,7 @@
 #include <util/delay.h>
 #include <stddef.h>
 
-// =========================================================================
-// hardware pin mapping (atmega32)
-// =========================================================================
-// porta (pa0..pa7) :
-//   pa0..pa3 : 4-bit multiplexed data/address bus (d0..d3)
-//   pa4..pa7 : 4-bit hardware rom/ram gpio port (wrr / wmp / rdr)
-// portb (pb0..pb3) : cm-ram bank selects (cm-ram0..cm-ram3 -> sram ce)
-// portc (pc0..pc7) : eeprom address latches & system clocks:
-//   pc0 : phi1 clock out
-//   pc1 : phi2 clock out
-//   pc2 : sync out
-//   pc3 : cm-rom out (eeprom /ce - active low)
-//   pc4 : latch_a1 strobe (eeprom pc bits 0..3)
-//   pc5 : latch_a2 strobe (eeprom pc bits 4..7)
-//   pc6 : rom_a0_pin (eeprom a0 for nibble selection)
-//   pc7 : latch_a3 strobe (eeprom pc bits 8..11)
-// portd (pd0..pd7) : sram control & system i/o:
-//   pd0 : sram_latch_low strobe (sram a0..a3)
-//   pd1 : sram_latch_high strobe (sram a4..a7)
-//   pd2 : reset pin input (active high)
-//   pd3 : test pin input  (active low)
-//   pd4 : sram_we_pin (write enable - active low)
-//   pd5 : sram_oe_pin (output enable - active low)
-//   pd6 : sram_a8_pin (0 = main memory, 1 = status memory)
-//   pd7 : unused / reserved
+
 
 #define BUS_PORT            PORTA
 #define BUS_PIN             PINA
@@ -65,9 +41,7 @@
 #define TEST_IS_LOW         (!(SYS_PIN & (1 << TEST_PIN)))
 #define RESET_IS_HIGH       (SYS_PIN & (1 << RESET_PIN))
 
-// =========================================================================
-// 4004 architecture state
-// =========================================================================
+
 static uint16_t pc = 0x000;           // 12-bit program counter
 static uint16_t stack[3] = {0, 0, 0};// 3-level hardware call stack
 static uint8_t  reg[16];             // 16 4-bit index registers
@@ -76,10 +50,6 @@ static uint8_t  carry = 0;           // 1-bit carry flag
 static uint8_t  cm_bank = 1;         // active cm-ram bank bitmask (1, 2, 4, 8)
 static uint8_t  src_reg = 0;         // latched 8-bit ram address from src
 
-// =========================================================================
-// authentic 740 khz intel 4004 clock engine & latch strobes (atmega32 @ 16 mhz)
-// =========================================================================
-// target phase clock period = 1351.35 ns (740 khz)
 
 #define CLOCK_PHI1() do { \
     CTRL_PORT |= (1 << PHI1_PIN);             /* pulse high */ \
@@ -118,9 +88,7 @@ static inline void strobe_sys_latch(uint8_t pin) {
     asm volatile("" ::: "memory");
 }
 
-// =========================================================================
-// pipelined machine cycle engine
-// =========================================================================
+
 uint8_t fetch_instruction_nibbles(uint16_t target_addr) {
     uint8_t opcode = 0;
 
@@ -225,9 +193,7 @@ uint8_t fetch_byte_2() {
     return b2;
 }
 
-// =========================================================================
-// decode and execute engine
-// =========================================================================
+
 void decode_and_execute() {
     if (RESET_IS_HIGH) {
         pc = 0; acc = 0; carry = 0; cm_bank = 1; src_reg = 0;
@@ -450,9 +416,6 @@ void decode_and_execute() {
     }
 }
 
-// =========================================================================
-// initialization and loop
-// =========================================================================
 void setup() {
     cli(); // disable interrupts immediately
 
