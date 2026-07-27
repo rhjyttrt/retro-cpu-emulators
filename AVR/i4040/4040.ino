@@ -1,0 +1,483 @@
+/* ==============================================================================
+   Intel 4040 Cycle-Accurate Physical Bus Engine (Arduino IDE Port)
+   Target Architecture: ATmega32 @ 20.0 MHz (e.g., via MightyCore)
+   Clock Rate: Strictly 740.74 kHz (27 AVR cycles = 1.35 us per sub-phase)
+
+   Physical Pin Mapping:
+     - PD0 : INT Hardware Interrupt Input (Active LOW)
+     - PD2 : PHI1 Output Clock
+     - PD3 : PHI2 Output Clock
+     - PD4 : TEST Input Line (Active LOW for JCN)
+     - PA0..PA3 : D0..D3 Multiplexed Data/Address Bus
+     - PA4 : SYNC Pulse Output
+     - PA5 : CM_ROM0 Control Output
+     - PA6 : CM_ROM1 Control Output
+     - PC0..PC7 : CM_RAM0..CM_RAM7 Control Outputs
+   ============================================================================== */
+
+#include <Arduino.h>
+#include <avr/io.h>
+#include <stdint.h>
+#include <stdbool.h>
+
+#ifndef F_CPU
+#define F_CPU 20000000UL
+#endif
+
+#define INT_PIN   PD0
+#define PHI1_PIN  PD2
+#define PHI2_PIN  PD3
+#define TEST_PIN  PD4
+#define SYNC_PIN  PA4
+
+typedef struct {
+    uint8_t  acc;
+    uint8_t  carry;
+    uint16_t pc;
+    uint8_t  index_reg[24];
+    uint8_t  reg_bank;
+    uint8_t  saved_reg_bank;
+    uint16_t stack[8];
+    uint8_t  sp;
+    uint8_t  rom_bank;
+    uint8_t  ram_bank;
+    
+    bool     in_second_cycle;
+    uint8_t  first_opr;
+    uint8_t  first_opa;
+    uint16_t first_page;
+    bool     interrupt_enable;
+    bool     in_interrupt;
+    bool     halted;
+} i4040_hardware_t;
+
+static i4040_hardware_t cpu;
+
+// ------------------------------------------------------------------------------
+// Deterministic 27-Cycle Sub-Phase Drivers (Pure 1-Cycle OUT Register Writes)
+// ------------------------------------------------------------------------------
+static inline void clock_phase_out_cm(uint8_t bus_nibble, bool sync, bool assert_cm_ram, bool assert_cm_rom) {
+    uint8_t cm_ram_mask = assert_cm_ram ? (1 << cpu.ram_bank) : 0;
+    uint8_t cm_rom_mask = assert_cm_rom ? ((cpu.rom_bank == 0) ? (1 << PA5) : (1 << PA6)) : 0;
+
+    uint8_t pa_out   = (PORTA & 0xE0) | (bus_nibble & 0x0F) | cm_rom_mask;
+    if (sync) pa_out |= (1 << SYNC_PIN);
+    else      pa_out &= ~(1 << SYNC_PIN);
+
+    uint8_t ddra_out  = DDRA | 0x0F;
+    uint8_t portc_on  = PORTC | cm_ram_mask;
+    uint8_t portc_off = PORTC & ~cm_ram_mask;
+    uint8_t pa_off    = pa_out & ~((1 << PA5) | (1 << PA6));
+
+    // 1. PHI1 HIGH (8 AVR cycles = 400 ns)
+    PORTD |= (1 << PHI1_PIN);                              // 2 cycles
+    asm volatile("nop\n nop\n nop\n nop\n nop\n nop\n");   // 6 cycles
+
+    // 2. PHI1 LOW / DEAD TIME 1 (5 AVR cycles = 250 ns)
+    PORTD &= ~(1 << PHI1_PIN);                              // 2 cycles
+    DDRA = ddra_out;                                        // 1 cycle
+    PORTA = pa_out;                                         // 1 cycle
+    asm volatile("nop\n");                                  // 1 cycle
+
+    // 3. PHI2 HIGH & CM STROBE (8 AVR cycles = 400 ns)
+    PORTD |= (1 << PHI2_PIN);                               // 2 cycles
+    PORTC = portc_on;                                       // 1 cycle
+    asm volatile("nop\n nop\n nop\n nop\n nop\n");         // 5 cycles
+
+    // 4. PHI2 LOW / DEAD TIME 2 (6 AVR cycles = 300 ns)
+    PORTD &= ~(1 << PHI2_PIN);                              // 2 cycles
+    PORTC = portc_off;                                      // 1 cycle
+    PORTA = pa_off;                                         // 1 cycle
+    asm volatile("nop\n nop\n");                            // 2 cycles
+}
+
+static inline uint8_t clock_phase_in_cm(bool assert_cm_ram, bool assert_cm_rom) {
+    uint8_t cm_ram_mask = assert_cm_ram ? (1 << cpu.ram_bank) : 0;
+    uint8_t cm_rom_mask = assert_cm_rom ? ((cpu.rom_bank == 0) ? (1 << PA5) : (1 << PA6)) : 0;
+
+    uint8_t ddra_in   = DDRA & ~0x0F;
+    uint8_t portc_on  = PORTC | cm_ram_mask;
+    uint8_t portc_off = PORTC & ~cm_ram_mask;
+    uint8_t pa_in     = (PORTA & ~0x0F) | cm_rom_mask;
+    uint8_t pa_off    = pa_in & ~((1 << PA5) | (1 << PA6));
+    uint8_t sample;
+
+    // 1. PHI1 HIGH (8 AVR cycles = 400 ns)
+    PORTD |= (1 << PHI1_PIN);                              // 2 cycles
+    asm volatile("nop\n nop\n nop\n nop\n nop\n nop\n");   // 6 cycles
+
+    // 2. PHI1 LOW / DEAD TIME 1 (5 AVR cycles = 250 ns)
+    PORTD &= ~(1 << PHI1_PIN);                              // 2 cycles
+    DDRA = ddra_in;                                         // 1 cycle
+    PORTA = pa_in;                                          // 1 cycle
+    asm volatile("nop\n");                                  // 1 cycle
+
+    // 3. PHI2 HIGH & DATA SAMPLE (8 AVR cycles = 400 ns)
+    PORTD |= (1 << PHI2_PIN);                               // 2 cycles
+    PORTC = portc_on;                                       // 1 cycle
+    asm volatile("nop\n");                                  // 1 cycle
+    sample = PINA & 0x0F;                                   // 1 cycle
+    asm volatile("nop\n nop\n nop\n");                     // 3 cycles
+
+    // 4. PHI2 LOW / DEAD TIME 2 (6 AVR cycles = 300 ns)
+    PORTD &= ~(1 << PHI2_PIN);                              // 2 cycles
+    PORTC = portc_off;                                      // 1 cycle
+    PORTA = pa_off;                                         // 1 cycle
+    asm volatile("nop\n nop\n");                            // 2 cycles
+
+    return sample;
+}
+
+static inline uint8_t get_reg_idx(uint8_t reg) {
+    reg &= 0x0F;
+    if (cpu.reg_bank == 1 && reg < 8) return 16 + reg;
+    return reg;
+}
+
+static inline bool get_test_pin(void) {
+    return (PIND & (1 << TEST_PIN)) ? true : false;
+}
+
+// ------------------------------------------------------------------------------
+// Core Step Function (1 Machine Cycle = Exactly 8 Sub-Phases = 10.8 us)
+// ------------------------------------------------------------------------------
+void i4040_hardware_step(void) {
+    // Hardware Interrupt Handling (Only sample on clean instruction boundaries)
+    if (cpu.interrupt_enable && !cpu.in_interrupt && !cpu.in_second_cycle && !(PIND & (1 << INT_PIN))) {
+        cpu.halted = false;
+        cpu.in_interrupt = true;
+        cpu.interrupt_enable = false;
+        
+        cpu.saved_reg_bank = cpu.reg_bank;
+        cpu.reg_bank = 1;
+
+        cpu.stack[cpu.sp & 0x07] = cpu.pc & 0x0FFF;
+        cpu.sp = (cpu.sp + 1) & 0x07;
+        cpu.pc = 0x003; // Hardware interrupt vector
+    }
+
+    if (cpu.halted) {
+        for (uint8_t i = 0; i < 8; i++) {
+            clock_phase_out_cm(0x0, (i == 0), false, false);
+        }
+        return;
+    }
+
+    // --- Phase A1..A3: Address Driving ---
+    uint16_t bus_addr = cpu.pc;
+    
+    if (cpu.in_second_cycle && (cpu.first_opr == 0x3 || (cpu.first_opr == 0x0 && cpu.first_opa == 0x0E))) {
+        uint8_t r0 = cpu.index_reg[get_reg_idx(0)];
+        uint8_t r1 = cpu.index_reg[get_reg_idx(1)];
+        bus_addr = (cpu.first_page | (r0 << 4) | r1) & 0x0FFF;
+    }
+
+    clock_phase_out_cm((bus_addr) & 0x0F, true, false, false);
+    clock_phase_out_cm((bus_addr >> 4) & 0x0F, false, false, false);
+    clock_phase_out_cm((bus_addr >> 8) & 0x0F, false, false, false);
+
+    // --- Phase M1..M2: Instruction Fetch ---
+    uint8_t opr = clock_phase_in_cm(false, true);
+    uint8_t opa = clock_phase_in_cm(false, true);
+
+    // --- Phase X1: Decode Phase ---
+    clock_phase_out_cm(0x0, false, false, false);
+
+    // --- Phase X2 & X3: Execution & External Bus Drivers ---
+    if (cpu.in_second_cycle) {
+        uint8_t prev_opr = cpu.first_opr;
+        uint8_t prev_opa = cpu.first_opa;
+        uint8_t data_byte = (opr << 4) | opa;
+
+        switch (prev_opr) {
+            case 0x0: // Group 0 Second-Cycle Ops
+                if (prev_opa == 0x0E) { // RPM
+                    cpu.acc = opa;
+                }
+                break;
+
+            case 0x1: { // JCN
+                bool cond = false;
+                if (prev_opa & 0x01) cond |= (get_test_pin() == false);
+                if (prev_opa & 0x02) cond |= (cpu.carry == 1);
+                if (prev_opa & 0x04) cond |= (cpu.acc == 0);
+                if (prev_opa & 0x08) cond = !cond;
+
+                if (cond) cpu.pc = ((cpu.pc & 0xF00) | data_byte) & 0x0FFF;
+                else      cpu.pc = (cpu.pc + 1) & 0x0FFF;
+                break;
+            }
+            case 0x2: // FIM
+                if ((prev_opa & 0x01) == 0) {
+                    uint8_t pair = prev_opa & 0x0E;
+                    cpu.index_reg[get_reg_idx(pair)]     = (data_byte >> 4) & 0x0F;
+                    cpu.index_reg[get_reg_idx(pair + 1)] = data_byte & 0x0F;
+                    cpu.pc = (cpu.pc + 1) & 0x0FFF;
+                }
+                break;
+
+            case 0x3: // FIN
+                if ((prev_opa & 0x01) == 0) {
+                    uint8_t pair = prev_opa & 0x0E;
+                    cpu.index_reg[get_reg_idx(pair)]     = opr;
+                    cpu.index_reg[get_reg_idx(pair + 1)] = opa;
+                }
+                break;
+
+            case 0x4: // JUN
+                cpu.pc = (((uint16_t)(prev_opa & 0x0F) << 8) | data_byte) & 0x0FFF;
+                break;
+
+            case 0x5: // JMS
+                cpu.stack[cpu.sp & 0x07] = (cpu.pc + 1) & 0x0FFF;
+                cpu.sp = (cpu.sp + 1) & 0x07;
+                cpu.pc = (((uint16_t)(prev_opa & 0x0F) << 8) | data_byte) & 0x0FFF;
+                break;
+
+            case 0x7: { // ISZ
+                uint8_t idx = get_reg_idx(prev_opa);
+                cpu.index_reg[idx] = (cpu.index_reg[idx] + 1) & 0x0F;
+                if (cpu.index_reg[idx] != 0) {
+                    cpu.pc = ((cpu.pc & 0xF00) | data_byte) & 0x0FFF;
+                } else {
+                    cpu.pc = (cpu.pc + 1) & 0x0FFF;
+                }
+                break;
+            }
+        }
+        clock_phase_out_cm(0x0, false, false, false);
+        clock_phase_out_cm(0x0, false, false, false);
+        cpu.in_second_cycle = false;
+    } else {
+        bool is_two_cycle = false;
+
+        switch (opr) {
+            case 0x0: // Group 0
+                switch (opa) {
+                    case 0x0: break; // NOP
+                    case 0x1: cpu.halted = true; break; // HLT
+                    case 0x2: { // BBS
+                        cpu.sp = (cpu.sp - 1) & 0x07;
+                        cpu.pc = cpu.stack[cpu.sp] & 0x0FFF;
+                        cpu.reg_bank = cpu.saved_reg_bank;
+                        cpu.in_interrupt = false;
+                        cpu.interrupt_enable = true;
+                        clock_phase_out_cm(0x0, false, false, false); // X2
+                        clock_phase_out_cm(0x0, false, false, false); // X3
+                        return;
+                    }
+                    case 0x3: cpu.acc = cpu.ram_bank; break; // LCR
+                    case 0x4: cpu.acc |= cpu.index_reg[get_reg_idx(4)]; break; // OR4
+                    case 0x5: cpu.acc |= cpu.index_reg[get_reg_idx(5)]; break; // OR5
+                    case 0x6: cpu.acc &= cpu.index_reg[get_reg_idx(6)]; break; // AN6
+                    case 0x7: cpu.acc &= cpu.index_reg[get_reg_idx(7)]; break; // AN7
+                    case 0x8: cpu.rom_bank = 0; break; // DB0
+                    case 0x9: cpu.rom_bank = 1; break; // DB1
+                    case 0x0A: cpu.reg_bank = 0; break; // SB0
+                    case 0x0B: cpu.reg_bank = 1; break; // SB1
+                    case 0x0C: cpu.interrupt_enable = false; break; // DIN
+                    case 0x0D: cpu.interrupt_enable = true; break;  // EIN
+                    case 0x0E: is_two_cycle = true; break;          // RPM (2-Cycle)
+                }
+                break;
+
+            case 0x1: is_two_cycle = true; break; // JCN
+
+            case 0x2:
+                if (opa & 0x01) { // SRC
+                    uint8_t pair = opa & 0x0E;
+                    uint8_t low_nib  = cpu.index_reg[get_reg_idx(pair + 1)];
+                    uint8_t high_nib = cpu.index_reg[get_reg_idx(pair)];
+                    
+                    clock_phase_out_cm(high_nib, false, true, false);
+                    clock_phase_out_cm(low_nib, false, true, false);
+                    cpu.pc = (cpu.pc + 1) & 0x0FFF;
+                    return;
+                } else {
+                    is_two_cycle = true; // FIM
+                }
+                break;
+
+            case 0x3:
+                if (opa & 0x01) { // JIN
+                    uint8_t pair = opa & 0x0E;
+                    uint16_t addr = ((uint16_t)cpu.index_reg[get_reg_idx(pair)] << 4) | 
+                                    cpu.index_reg[get_reg_idx(pair + 1)];
+                    cpu.pc = ((cpu.pc & 0xF00) | addr) & 0x0FFF;
+                    clock_phase_out_cm(0x0, false, false, false); // X2
+                    clock_phase_out_cm(0x0, false, false, false); // X3
+                    return;
+                } else {
+                    is_two_cycle = true; // FIN (2-Cycle)
+                }
+                break;
+
+            case 0x4: is_two_cycle = true; break; // JUN
+            case 0x5: is_two_cycle = true; break; // JMS
+
+            case 0x6: { // INC
+                uint8_t idx = get_reg_idx(opa);
+                cpu.index_reg[idx] = (cpu.index_reg[idx] + 1) & 0x0F;
+                break;
+            }
+
+            case 0x7: is_two_cycle = true; break; // ISZ
+
+            case 0x8: { // ADD
+                uint8_t val = cpu.index_reg[get_reg_idx(opa)];
+                uint16_t sum = cpu.acc + val + cpu.carry;
+                cpu.carry = (sum > 15) ? 1 : 0;
+                cpu.acc = sum & 0x0F;
+                break;
+            }
+
+            case 0x9: { // SUB
+                uint8_t val = cpu.index_reg[get_reg_idx(opa)];
+                uint16_t sum = cpu.acc + (~val & 0x0F) + cpu.carry;
+                cpu.carry = (sum > 15) ? 1 : 0;
+                cpu.acc = sum & 0x0F;
+                break;
+            }
+
+            case 0xA: cpu.acc = cpu.index_reg[get_reg_idx(opa)]; break; // LD
+
+            case 0xB: { // XCH
+                uint8_t idx = get_reg_idx(opa);
+                uint8_t tmp = cpu.acc;
+                cpu.acc = cpu.index_reg[idx];
+                cpu.index_reg[idx] = tmp;
+                break;
+            }
+
+            case 0xC: { // BBL
+                cpu.sp = (cpu.sp - 1) & 0x07;
+                cpu.pc = cpu.stack[cpu.sp] & 0x0FFF;
+                cpu.acc = opa & 0x0F;
+                clock_phase_out_cm(0x0, false, false, false); // X2
+                clock_phase_out_cm(0x0, false, false, false); // X3
+                return;
+            }
+
+            case 0xD: cpu.acc = opa & 0x0F; break; // LDM
+
+            case 0xE: // I/O Operations
+                if (opa <= 0x7) { // Writes
+                    bool is_rom_io = (opa == 0x02);
+                    clock_phase_out_cm(cpu.acc, false, !is_rom_io, is_rom_io); // X2
+                    clock_phase_out_cm(cpu.acc, false, false, false);          // X3
+                } else { // Reads
+                    bool is_rom_io = (opa == 0x0A);
+                    uint8_t rval = clock_phase_in_cm(!is_rom_io, is_rom_io);   // X2
+                    
+                    if (opa == 0x08) { // SBM
+                        uint16_t sum = cpu.acc + (~rval & 0x0F) + cpu.carry;
+                        cpu.carry = (sum > 15) ? 1 : 0;
+                        cpu.acc = sum & 0x0F;
+                    } else if (opa == 0x0B) { // ADM
+                        uint16_t sum = cpu.acc + rval + cpu.carry;
+                        cpu.carry = (sum > 15) ? 1 : 0;
+                        cpu.acc = sum & 0x0F;
+                    } else { // RDM, RDR, RD0..RD3
+                        cpu.acc = rval;
+                    }
+                    clock_phase_in_cm(false, false);                            // X3
+                }
+                cpu.pc = (cpu.pc + 1) & 0x0FFF;
+                return;
+
+            case 0xF: // Group F Accumulator Ops
+                switch (opa) {
+                    case 0x0: cpu.acc = 0; cpu.carry = 0; break; // CLB
+                    case 0x1: cpu.carry = 0; break;              // CLC
+                    case 0x2: cpu.acc++; cpu.carry = (cpu.acc > 15) ? 1 : 0; cpu.acc &= 0x0F; break; // IAC
+                    case 0x3: cpu.carry ^= 1; break;              // CMC
+                    case 0x4: cpu.acc = (~cpu.acc) & 0x0F; break; // CMA
+                    case 0x5: { // RAL
+                        uint8_t new_c = (cpu.acc & 0x08) ? 1 : 0;
+                        cpu.acc = ((cpu.acc << 1) | cpu.carry) & 0x0F;
+                        cpu.carry = new_c;
+                        break;
+                    }
+                    case 0x6: { // RAR
+                        uint8_t new_c = cpu.acc & 0x01;
+                        cpu.acc = ((cpu.acc >> 1) | (cpu.carry << 3)) & 0x0F;
+                        cpu.carry = new_c;
+                        break;
+                    }
+                    case 0x7: // TCC
+                        cpu.acc = cpu.carry & 0x01;
+                        cpu.carry = 0;
+                        break;
+                    case 0x8: // DAC
+                        if (cpu.acc == 0) { cpu.acc = 15; cpu.carry = 0; }
+                        else { cpu.acc--; cpu.carry = 1; }
+                        break;
+                    case 0x9: cpu.acc = (cpu.carry == 0) ? 9 : 10; cpu.carry = 0; break; // TCS
+                    case 0x0A: cpu.carry = 1; break; // STC
+                    case 0x0B: { // DAA
+                        if (cpu.acc > 9 || cpu.carry) {
+                            uint8_t sum = cpu.acc + 6;
+                            cpu.carry = (sum > 15) ? 1 : 0;
+                            cpu.acc = sum & 0x0F;
+                        }
+                        break;
+                    }
+                    case 0x0C: // KBP
+                        if (cpu.acc == 1) cpu.acc = 1;
+                        else if (cpu.acc == 2) cpu.acc = 2;
+                        else if (cpu.acc == 4) cpu.acc = 3;
+                        else if (cpu.acc == 8) cpu.acc = 4;
+                        else if (cpu.acc == 0) cpu.acc = 0;
+                        else cpu.acc = 15;
+                        break;
+                    case 0x0D: cpu.ram_bank = cpu.acc & 0x07; break; // DCL
+                    case 0x0F: // TCI
+                        cpu.acc = (!cpu.carry) & 0x01;
+                        cpu.carry = 0;
+                        break;
+                }
+                break;
+        }
+
+        if (is_two_cycle) {
+            cpu.in_second_cycle = true;
+            cpu.first_opr = opr;
+            cpu.first_opa = opa;
+            cpu.first_page = cpu.pc & 0xF00;
+            cpu.pc = (cpu.pc + 1) & 0x0FFF;
+        } else {
+            cpu.pc = (cpu.pc + 1) & 0x0FFF;
+        }
+
+        clock_phase_out_cm(0x0, false, false, false);
+        clock_phase_out_cm(0x0, false, false, false);
+    }
+}
+
+// ------------------------------------------------------------------------------
+// Arduino IDE Setup & Loop
+// ------------------------------------------------------------------------------
+void setup(void) {
+    DDRD |= (1 << PHI1_PIN) | (1 << PHI2_PIN);
+    DDRD &= ~((1 << TEST_PIN) | (1 << INT_PIN));
+    PORTD |= (1 << TEST_PIN) | (1 << INT_PIN);
+
+    DDRA |= (1 << SYNC_PIN) | (1 << PA5) | (1 << PA6);
+    DDRC = 0xFF; // All 8 CM_RAM lines as outputs
+
+    PORTD &= ~((1 << PHI1_PIN) | (1 << PHI2_PIN));
+    PORTA &= ~(1 << SYNC_PIN);
+
+    cpu.acc = 0; cpu.carry = 0; cpu.pc = 0;
+    cpu.rom_bank = 0; cpu.ram_bank = 0; cpu.reg_bank = 0;
+    cpu.sp = 0; cpu.in_second_cycle = false;
+    cpu.interrupt_enable = false; cpu.in_interrupt = false;
+    cpu.halted = false;
+}
+
+void loop(void) {
+    // Continuous loop inside loop() maintains sub-phase timing precision
+    while (1) {
+        i4040_hardware_step();
+    }
+}
