@@ -40,9 +40,8 @@ static inline void clock_phase_out_cm(uint8_t bus_nibble, bool sync, bool assert
     uint8_t cm_ram_mask = assert_cm_ram ? (1 << cpu.ram_bank) : 0;
     uint8_t cm_rom_mask = assert_cm_rom ? ((cpu.rom_bank == 0) ? (1 << PA5) : (1 << PA6)) : 0;
 
-    uint8_t pa_out   = (PORTA & 0xE0) | (bus_nibble & 0x0F) | cm_rom_mask;
+    uint8_t pa_out    = (PORTA & 0x80) | (bus_nibble & 0x0F) | cm_rom_mask;
     if (sync) pa_out |= (1 << SYNC_PIN);
-    else      pa_out &= ~(1 << SYNC_PIN);
 
     uint8_t ddra_out  = DDRA | 0x0F;
     uint8_t portc_on  = PORTC | cm_ram_mask;
@@ -74,7 +73,7 @@ static inline uint8_t clock_phase_in_cm(bool assert_cm_ram, bool assert_cm_rom) 
     uint8_t ddra_in   = DDRA & ~0x0F;
     uint8_t portc_on  = PORTC | cm_ram_mask;
     uint8_t portc_off = PORTC & ~cm_ram_mask;
-    uint8_t pa_in     = (PORTA & ~0x0F) | cm_rom_mask;
+    uint8_t pa_in     = (PORTA & 0x80) | cm_rom_mask;
     uint8_t pa_off    = pa_in & ~((1 << PA5) | (1 << PA6));
     uint8_t sample;
 
@@ -133,10 +132,14 @@ void i4040_hardware_step(void) {
 
     uint16_t bus_addr = cpu.pc;
     
-    if (cpu.in_second_cycle && (cpu.first_opr == 0x3 || (cpu.first_opr == 0x0 && cpu.first_opa == 0x0E))) {
+    if (cpu.in_second_cycle) {
         uint8_t r0 = cpu.index_reg[get_reg_idx(0)];
         uint8_t r1 = cpu.index_reg[get_reg_idx(1)];
-        bus_addr = (cpu.first_page | (r0 << 4) | r1) & 0x0FFF;
+        if (cpu.first_opr == 0x3) {
+            bus_addr = ((r0 << 4) | r1) & 0x0FFF;
+        } else if (cpu.first_opr == 0x0 && cpu.first_opa == 0x0E) {
+            bus_addr = (cpu.first_page | (r0 << 4) | r1) & 0x0FFF;
+        }
     }
 
     clock_phase_out_cm((bus_addr) & 0x0F, true, false, false);
@@ -146,7 +149,9 @@ void i4040_hardware_step(void) {
     uint8_t opr = clock_phase_in_cm(false, true);
     uint8_t opa = clock_phase_in_cm(false, true);
 
-    clock_phase_out_cm(0x0, false, false, false);
+    // Send OPA command modifier during X1 only on cycle 1 for RAM/IO group (0xE)
+    uint8_t x1_nibble = (!cpu.in_second_cycle && opr == 0xE) ? opa : 0x0;
+    clock_phase_out_cm(x1_nibble, false, false, false);
 
     if (cpu.in_second_cycle) {
         uint8_t prev_opr = cpu.first_opr;
@@ -167,7 +172,7 @@ void i4040_hardware_step(void) {
                 if (prev_opa & 0x04) cond |= (cpu.acc == 0);
                 if (prev_opa & 0x08) cond = !cond;
 
-                if (cond) cpu.pc = ((cpu.pc & 0xF00) | data_byte) & 0x0FFF;
+                if (cond) cpu.pc = (cpu.first_page | data_byte) & 0x0FFF;
                 else      cpu.pc = (cpu.pc + 1) & 0x0FFF;
                 break;
             }
@@ -202,7 +207,7 @@ void i4040_hardware_step(void) {
                 uint8_t idx = get_reg_idx(prev_opa);
                 cpu.index_reg[idx] = (cpu.index_reg[idx] + 1) & 0x0F;
                 if (cpu.index_reg[idx] != 0) {
-                    cpu.pc = ((cpu.pc & 0xF00) | data_byte) & 0x0FFF;
+                    cpu.pc = (cpu.first_page | data_byte) & 0x0FFF;
                 } else {
                     cpu.pc = (cpu.pc + 1) & 0x0FFF;
                 }
@@ -239,8 +244,8 @@ void i4040_hardware_step(void) {
                     case 0x9: cpu.rom_bank = 1; break;
                     case 0x0A: cpu.reg_bank = 0; break;
                     case 0x0B: cpu.reg_bank = 1; break;
-                    case 0x0C: cpu.interrupt_enable = false; break;
-                    case 0x0D: cpu.interrupt_enable = true; break;
+                    case 0x0C: cpu.interrupt_enable = true; break;  // EIN
+                    case 0x0D: cpu.interrupt_enable = false; break; // DIN
                     case 0x0E: is_two_cycle = true; break;
                 }
                 break;
@@ -381,7 +386,7 @@ void i4040_hardware_step(void) {
                     case 0x0B: {
                         if (cpu.acc > 9 || cpu.carry) {
                             uint8_t sum = cpu.acc + 6;
-                            cpu.carry = (sum > 15) ? 1 : 0;
+                            if (sum > 15) cpu.carry = 1;
                             cpu.acc = sum & 0x0F;
                         }
                         break;
