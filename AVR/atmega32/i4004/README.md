@@ -31,14 +31,6 @@ Below is the pin mapping between the **Intel 4004 signal definitions** and the *
 
 ---
 
-## Hardware Requirements
-
-1. **Microcontroller:** ATmega32@20mhz
- across `XTAL1` (Pin 13) and `XTAL2` (Pin 12) with two 22pF ceramic capacitors.
-2. **Power Supply:** Stable +5V DC VCC power source.
-
----
-
 ## Getting Started
 
 ### 1. Fuses Configuration
