@@ -4,7 +4,6 @@
 
 #pragma GCC optimize ("O3")
 
-// State pin codes
 #define STATE_TW   0x00
 #define STATE_TH   0x01
 #define STATE_T1   0x02
@@ -17,13 +16,11 @@
 #define SYNC_HIGH  0x08
 #define SYNC_LOW   0x00
 
-// Cycle control bits
 #define CC_PCI     0x00
 #define CC_PCC     0x40
 #define CC_PCR     0x80
 #define CC_PCW     0xC0
 
-// CPU registers (Requires -ffixed-r2 through -ffixed-r8 during GCC compilation)
 register uint8_t regA asm("r2");
 register uint8_t regB asm("r3");
 register uint8_t regC asm("r4");
@@ -32,13 +29,11 @@ register uint8_t regE asm("r6");
 register uint8_t regH asm("r7");
 register uint8_t regL asm("r8");
 
-// Flags
 uint8_t flag_C = 0;
 uint8_t flag_Z = 0;
 uint8_t flag_S = 0;
 uint8_t flag_P = 0;
 
-// Call stack (14-bit 8-level circular stack)
 uint16_t address_stack[8];
 uint8_t  stack_ptr = 0;
 
@@ -55,7 +50,6 @@ __attribute__((always_inline)) inline void pop_stack(void) {
     stack_ptr = (stack_ptr == 0) ? 7 : (stack_ptr - 1);
 }
 
-// Bitwise even-parity reduction (1 for EVEN parity, 0 for ODD)
 __attribute__((always_inline)) inline uint8_t get_parity(uint8_t val) {
     val ^= val >> 4;
     val ^= val >> 2;
@@ -69,7 +63,6 @@ __attribute__((always_inline)) inline void update_ZSP(uint8_t res) {
     flag_P = get_parity(res);
 }
 
-// Timer1 clock setup
 void setup_hardware_clocks(void) {
     DDRD |= (1 << PD4) | (1 << PD5);
 
@@ -84,13 +77,11 @@ void setup_hardware_clocks(void) {
     OCR1B = 12;
 }
 
-// Sync to timer edge safely across roll-over boundary
 __attribute__((always_inline)) inline void sync_to_phi2_fall(void) {
     while (TCNT1 >= 18);
     while (TCNT1 < 18);
 }
 
-// Bus phase T1
 __attribute__((always_inline)) inline void bus_T1(uint16_t addr, uint8_t state_code) {
     sync_to_phi2_fall();
     PORTA = (uint8_t)(addr & 0xFF);
@@ -100,7 +91,6 @@ __attribute__((always_inline)) inline void bus_T1(uint16_t addr, uint8_t state_c
     PORTB = state_code | SYNC_LOW;
 }
 
-// Bus phase T2
 __attribute__((always_inline)) inline void bus_T2(uint8_t high_byte, uint8_t cc_bits) {
     sync_to_phi2_fall();
     PORTA = (high_byte & 0x3F) | cc_bits;
@@ -120,7 +110,6 @@ __attribute__((always_inline)) inline void bus_T2(uint8_t high_byte, uint8_t cc_
     }
 }
 
-// Bus phase T3 read (Tri-states PORTA to prevent bus contention)
 __attribute__((always_inline)) inline uint8_t bus_T3_read(void) {
     DDRA  = 0x00;
     PORTA = 0x00;
@@ -133,7 +122,6 @@ __attribute__((always_inline)) inline uint8_t bus_T3_read(void) {
     return val;
 }
 
-// Bus phase T3 write
 __attribute__((always_inline)) inline void bus_T3_write(uint8_t val) {
     sync_to_phi2_fall();
     DDRA  = 0xFF;
@@ -141,12 +129,11 @@ __attribute__((always_inline)) inline void bus_T3_write(uint8_t val) {
     PORTB = STATE_T3 | SYNC_HIGH;
     asm volatile("nop\n nop\n nop\n nop\n");
     PORTB = STATE_T3 | SYNC_LOW;
-    asm volatile("nop\n nop\n"); // Bus hold time (t_DH)
+    asm volatile("nop\n nop\n");
     PORTA = 0x00;
     DDRA  = 0x00;
 }
 
-// Bus phase T4
 __attribute__((always_inline)) inline void bus_T4(void) {
     sync_to_phi2_fall();
     PORTB = STATE_T4 | SYNC_HIGH;
@@ -154,7 +141,6 @@ __attribute__((always_inline)) inline void bus_T4(void) {
     PORTB = STATE_T4 | SYNC_LOW;
 }
 
-// Bus phase T5
 __attribute__((always_inline)) inline void bus_T5(void) {
     sync_to_phi2_fall();
     PORTB = STATE_T5 | SYNC_HIGH;
@@ -162,21 +148,18 @@ __attribute__((always_inline)) inline void bus_T5(void) {
     PORTB = STATE_T5 | SYNC_LOW;
 }
 
-// Fetch byte from memory
 __attribute__((always_inline)) inline uint8_t fetch_memory_byte(uint16_t addr, uint8_t cc_type, uint8_t t1_code) {
     bus_T1(addr, t1_code);
     bus_T2((uint8_t)(addr >> 8), cc_type);
     return bus_T3_read();
 }
 
-// Write byte to memory
 __attribute__((always_inline)) inline void write_memory_byte(uint16_t addr, uint8_t val) {
     bus_T1(addr, STATE_T1);
     bus_T2((uint8_t)(addr >> 8), CC_PCW);
     bus_T3_write(val);
 }
 
-// Read CPU register
 __attribute__((always_inline)) inline uint8_t get_reg_val(uint8_t index) {
     switch (index & 0x07) {
         case 0: return regA;
@@ -197,7 +180,6 @@ __attribute__((always_inline)) inline uint8_t get_reg_val(uint8_t index) {
     return 0;
 }
 
-// Write CPU register
 __attribute__((always_inline)) inline void set_reg_val(uint8_t index, uint8_t val) {
     switch (index & 0x07) {
         case 0: regA = val; break;
@@ -217,30 +199,29 @@ __attribute__((always_inline)) inline void set_reg_val(uint8_t index, uint8_t va
     }
 }
 
-// Execute ALU operations
 __attribute__((always_inline)) inline void execute_ALU(uint8_t op, uint8_t operand) {
     switch (op & 0x07) {
-        case 0: { // ADD
+        case 0: {
             uint16_t res = (uint16_t)regA + (uint16_t)operand;
             flag_C = (res > 0xFF) ? 1 : 0;
             regA = res & 0xFF;
             update_ZSP(regA);
             break;
         }
-        case 1: { // ADC
+        case 1: {
             uint16_t res = (uint16_t)regA + (uint16_t)operand + flag_C;
             flag_C = (res > 0xFF) ? 1 : 0;
             regA = res & 0xFF;
             update_ZSP(regA);
             break;
         }
-        case 2: { // SUB
+        case 2: {
             flag_C = (regA < operand) ? 1 : 0;
             regA = (regA - operand) & 0xFF;
             update_ZSP(regA);
             break;
         }
-        case 3: { // SBB
+        case 3: {
             uint16_t temp_a = regA;
             uint16_t temp_sub = (uint16_t)operand + flag_C;
             flag_C = (temp_a < temp_sub) ? 1 : 0;
@@ -248,25 +229,25 @@ __attribute__((always_inline)) inline void execute_ALU(uint8_t op, uint8_t opera
             update_ZSP(regA);
             break;
         }
-        case 4: { // ANA
+        case 4: {
             regA &= operand;
             flag_C = 0;
             update_ZSP(regA);
             break;
         }
-        case 5: { // XRA
+        case 5: {
             regA ^= operand;
             flag_C = 0;
             update_ZSP(regA);
             break;
         }
-        case 6: { // ORA
+        case 6: {
             regA |= operand;
             flag_C = 0;
             update_ZSP(regA);
             break;
         }
-        case 7: { // CMP
+        case 7: {
             flag_C = (regA < operand) ? 1 : 0;
             uint8_t temp_sub = (regA - operand) & 0xFF;
             update_ZSP(temp_sub);
@@ -275,23 +256,21 @@ __attribute__((always_inline)) inline void execute_ALU(uint8_t op, uint8_t opera
     }
 }
 
-// Evaluate condition codes matching Intel 8008 specification
 __attribute__((always_inline)) inline uint8_t check_condition(uint8_t opcode) {
     uint8_t cond = (opcode >> 3) & 0x07;
     switch (cond) {
-        case 0: return (flag_C == 0); // NC (No Carry) / RFC
-        case 4: return (flag_C == 1); // C  (Carry)    / RTC
-        case 1: return (flag_Z == 0); // NZ (Not Zero) / RFZ
-        case 5: return (flag_Z == 1); // Z  (Zero)     / RTZ
-        case 2: return (flag_S == 0); // P  (Positive) / RFP
-        case 6: return (flag_S == 1); // M  (Minus)    / RFM
-        case 3: return (flag_P == 0); // PO (Parity O) / RPO
-        case 7: return (flag_P == 1); // PE (Parity E) / RPE
+        case 0: return (flag_C == 0);
+        case 4: return (flag_C == 1);
+        case 1: return (flag_Z == 0);
+        case 5: return (flag_Z == 1);
+        case 2: return (flag_S == 0);
+        case 6: return (flag_S == 1);
+        case 3: return (flag_P == 0);
+        case 7: return (flag_P == 1);
     }
     return 0;
 }
 
-// Run single instruction cycle
 void run_emulator_cycle(void) {
     uint8_t is_interrupt = 0;
     uint8_t t1_state_code = STATE_T1;
@@ -310,7 +289,6 @@ void run_emulator_cycle(void) {
         PC = (PC + 1) & 0x3FFF;
     }
 
-    // HALT instructions (0x00, 0x01, 0x38, 0x39, 0x3F, 0xFF)
     if (opcode == 0x00 || opcode == 0x01 || opcode == 0x38 || 
         opcode == 0x39 || opcode == 0x3F || opcode == 0xFF) {
         while (!(PIND & (1 << PD3))) {
@@ -322,7 +300,6 @@ void run_emulator_cycle(void) {
         return;
     }
 
-    // MOV
     if ((opcode & 0xC0) == 0xC0) {
         uint8_t dest = (opcode >> 3) & 0x07;
         uint8_t src  = opcode & 0x07;
@@ -332,7 +309,6 @@ void run_emulator_cycle(void) {
         return;
     }
 
-    // ALU register
     if ((opcode & 0xC0) == 0x80) {
         uint8_t op  = (opcode >> 3) & 0x07;
         uint8_t src = opcode & 0x07;
@@ -340,39 +316,37 @@ void run_emulator_cycle(void) {
         return;
     }
 
-    // Top-bits 00 instructions
     if ((opcode & 0xC0) == 0x00) {
         uint8_t sub_op = opcode & 0x07;
 
-        // INC / DEC (Preserves Carry flag across operations)
         if (sub_op == 0x00 || sub_op == 0x01) {
             uint8_t reg_idx = (opcode >> 3) & 0x07;
-            if (reg_idx == 0) return; // 0x00 / 0x01 are HALTs
+            if (reg_idx == 0) return;
 
             uint8_t reg_val = get_reg_val(reg_idx);
             uint8_t val = (sub_op == 0x00) ? (reg_val + 1) : (reg_val - 1);
 
             set_reg_val(reg_idx, val);
-            update_ZSP(val); // Updates Zero, Sign, and Parity without altering flag_C
+            update_ZSP(val);
             return;
         }
-        // Rotates
+
         if (sub_op == 0x02) {
             uint8_t rot_type = (opcode >> 3) & 0x07;
             if (rot_type < 4) {
                 uint8_t old_carry = flag_C ? 1 : 0;
 
-                if (rot_type == 0) {       // RLC
+                if (rot_type == 0) {
                     flag_C = (regA & 0x80) ? 1 : 0;
                     regA = ((regA << 1) | flag_C) & 0xFF;
-                } else if (rot_type == 1) { // RRC
+                } else if (rot_type == 1) {
                     flag_C = (regA & 0x01) ? 1 : 0;
                     regA = (regA >> 1) | (flag_C << 7);
-                } else if (rot_type == 2) { // RAL
+                } else if (rot_type == 2) {
                     uint8_t bit7 = (regA & 0x80) ? 1 : 0;
                     regA = ((regA << 1) | old_carry) & 0xFF;
                     flag_C = bit7;
-                } else if (rot_type == 3) { // RAR
+                } else if (rot_type == 3) {
                     uint8_t bit0 = regA & 0x01;
                     regA = (regA >> 1) | (old_carry << 7);
                     flag_C = bit0;
@@ -380,14 +354,14 @@ void run_emulator_cycle(void) {
             }
             return;
         }
-        // Conditional RET (Handles RFC, RTC, RFZ, RTZ, RFP, RFM, RPO, RPE)
+
         if (sub_op == 0x03) {
             if (check_condition(opcode)) {
                 pop_stack();
             }
             return;
         }
-        // Immediate ALU
+
         if (sub_op == 0x04) {
             uint8_t imm_val = fetch_memory_byte(is_interrupt ? saved_pc : PC, CC_PCR, is_interrupt ? STATE_T1I : STATE_T1);
             if (is_interrupt) {
@@ -400,13 +374,13 @@ void run_emulator_cycle(void) {
             execute_ALU(op, imm_val);
             return;
         }
-        // RST
+
         if (sub_op == 0x05) {
             uint16_t target = (opcode & 0x38); 
             push_stack(target, is_interrupt ? saved_pc : PC);
             return;
         }
-        // Load immediate
+
         if (sub_op == 0x06) {
             uint8_t imm_val = fetch_memory_byte(is_interrupt ? saved_pc : PC, CC_PCR, is_interrupt ? STATE_T1I : STATE_T1);
             uint8_t dest = (opcode >> 3) & 0x07;
@@ -419,16 +393,14 @@ void run_emulator_cycle(void) {
             }
             return;
         }
-        // Unconditional RET
+
         if (sub_op == 0x07) {
             pop_stack();
             return;
         }
     }
 
-    // Top-bits 01 instructions
     if ((opcode & 0xC0) == 0x40) {
-        // Conditional Jump (01 ccc 000)
         if ((opcode & 0x07) == 0x00) {
             uint8_t t1_type = is_interrupt ? STATE_T1I : STATE_T1;
             uint16_t operand_pc = is_interrupt ? saved_pc : PC;
@@ -444,7 +416,6 @@ void run_emulator_cycle(void) {
             return;
         }
 
-        // Conditional Call (01 ccc 010)
         if ((opcode & 0x07) == 0x02) {
             uint8_t t1_type = is_interrupt ? STATE_T1I : STATE_T1;
             uint16_t operand_pc = is_interrupt ? saved_pc : PC;
@@ -464,7 +435,6 @@ void run_emulator_cycle(void) {
             return;
         }
 
-        // Unconditional Jump (01 xxx 100)
         if ((opcode & 0x07) == 0x04) {
             uint8_t t1_type = is_interrupt ? STATE_T1I : STATE_T1;
             uint16_t operand_pc = is_interrupt ? saved_pc : PC;
@@ -474,7 +444,6 @@ void run_emulator_cycle(void) {
             return;
         }
 
-        // Unconditional Call (01 xxx 110)
         if ((opcode & 0x07) == 0x06) {
             uint8_t t1_type = is_interrupt ? STATE_T1I : STATE_T1;
             uint16_t operand_pc = is_interrupt ? saved_pc : PC;
@@ -490,7 +459,6 @@ void run_emulator_cycle(void) {
             return;
         }
 
-        // I/O instructions (01 rrr rr1)
         if ((opcode & 0x01) == 0x01) {
             uint8_t port_num = (opcode >> 1) & 0x1F;
 
@@ -498,9 +466,9 @@ void run_emulator_cycle(void) {
             bus_T2(port_num, CC_PCC);
 
             if ((opcode & 0x30) == 0x00) {
-                regA = bus_T3_read();  // Input ports 0-7 (bits 5..4 == 00)
+                regA = bus_T3_read();
             } else {
-                bus_T3_write(regA);   // Output ports 8-31 (bits 5..4 != 00)
+                bus_T3_write(regA);
             }
             bus_T4();
             bus_T5();
@@ -509,7 +477,6 @@ void run_emulator_cycle(void) {
     }
 }
 
-// Entry point
 int main(void) {
     DDRB |= (1 << PB0) | (1 << PB1) | (1 << PB2) | (1 << PB3); 
     DDRD &= ~((1 << PD2) | (1 << PD3));                        
